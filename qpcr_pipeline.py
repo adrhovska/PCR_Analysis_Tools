@@ -706,7 +706,11 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
         targets = sorted(pdf["Target"].unique())
         samples = _sample_order(pdf)
 
-        for suffix, with_anchor in [("raw", False), ("with_anchor", True)]:
+        variants = [("raw", False)]
+        if anchor_sample is not None:
+            variants.append(("with_anchor", True))
+
+        for suffix, with_anchor in variants:
             fig, axes = plt.subplots(len(targets), 1,
                                       figsize=(max(8, 0.5 * len(samples)), 4 * len(targets)),
                                       sharex=True)
@@ -838,9 +842,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--plate-labels", nargs="+", default=None,
                     help="Custom plate labels, matched by order to --input "
                          "(default: file stem).")
-    p.add_argument("--anchor", nargs="+", required=True,
+    p.add_argument("--anchor", nargs="+", default=None,
                     help="Anchor SAMPLE name (exact 'Sample' text, e.g. 'Empty 1'), "
-                         "one per --input file in the same order.")
+                         "one per --input file in the same order. Required if "
+                         "--housekeeping is set (needed for the ddCt calculation); "
+                         "optional otherwise -- if given without --housekeeping, it "
+                         "only highlights that sample as a reference line in the "
+                         "'with_anchor' Cq plot, no ddCt math is done.")
     p.add_argument("--control-condition", default=None,
                     help="Baseline condition group used for statistical comparisons "
                          "(default: condition resolved from the first plate's anchor "
@@ -858,8 +866,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "over DA3's own Biogroup field and over --condition-regex. "
                          "Use this when Sample names don't encode the replicate at all "
                          "and the DA3 'Biogroup' field was not set either.")
-    p.add_argument("--housekeeping", default="GAPDH",
-                    help="Housekeeping gene / Target name (default: GAPDH).")
+    p.add_argument("--housekeeping", default=None,
+                    help="Housekeeping gene / Target name for the ddCt method "
+                         "(e.g. GAPDH). Omit this entirely for experiments that "
+                         "don't have a relative-quantification reference gene "
+                         "(e.g. a cloning/junction-validation qPCR) -- the pipeline "
+                         "then runs QC + raw Cq plots only and skips ddCt/RQ/log2FC "
+                         "and the statistics step, rather than forcing a fake "
+                         "normalization that would just produce all-NaN results.")
     p.add_argument("--sd-threshold", type=float, default=0.3,
                     help="Max allowed technical-replicate Cq SD before outlier "
                          "removal kicks in (default: 0.3).")
@@ -882,7 +896,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
-    if len(args.anchor) != len(args.input):
+    if args.housekeeping is not None and not args.anchor:
+        sys.exit("--anchor is required when --housekeeping is set "
+                  "(the ddCt method needs a calibrator sample per plate).")
+
+    if args.anchor is not None and len(args.anchor) != len(args.input):
         sys.exit(f"--anchor must have exactly one value per --input file "
                   f"({len(args.input)} inputs, {len(args.anchor)} anchors given).")
 
@@ -904,7 +922,7 @@ def main(argv=None):
     LOG.info("SD threshold: %s | exploratory=%s | fail_strategy=%s",
               args.sd_threshold, args.exploratory, args.fail_strategy)
 
-    anchor_by_plate = dict(zip(plate_labels, args.anchor))
+    anchor_by_plate = dict(zip(plate_labels, args.anchor)) if args.anchor else {}
 
     sample_map = load_sample_map(args.sample_map) if args.sample_map else None
     if sample_map is not None:
@@ -944,48 +962,59 @@ def main(argv=None):
         n_imputed = group_summary["Imputed"].sum()
         LOG.info("Exploratory mode ('%s'): %d groups imputed", args.fail_strategy, n_imputed)
 
-    # 4. ddCt 
-    LOG.info("Computing ddCt / RQ / log2FC (housekeeping=%s)", args.housekeeping)
-    ddct_df = compute_ddct(group_summary, args.housekeeping, anchor_by_plate)
+    # 4. ddCt (skipped entirely if --housekeeping was not given)
+    ddct_df = None
+    stats_results = {}
+    control_condition = None
 
-    control_condition = args.control_condition
-    if control_condition is None:
-        first_plate, first_anchor = plate_labels[0], args.anchor[0]
-        control_condition, _, source = resolver.resolve(first_plate, first_anchor)
-        LOG.info("--control-condition not given; resolved '%s' from first anchor "
-                  "'%s' via %s", control_condition, first_anchor, source)
+    if args.housekeeping is not None:
+        LOG.info("Computing ddCt / RQ / log2FC (housekeeping=%s)", args.housekeeping)
+        ddct_df = compute_ddct(group_summary, args.housekeeping, anchor_by_plate)
 
-    # 5. statistics 
-    LOG.info("Running statistics vs. control condition '%s'", control_condition)
-    stats_results = run_all_stats(ddct_df, control_condition, args.alpha)
+        control_condition = args.control_condition
+        if control_condition is None:
+            first_plate, first_anchor = plate_labels[0], args.anchor[0]
+            control_condition, _, source = resolver.resolve(first_plate, first_anchor)
+            LOG.info("--control-condition not given; resolved '%s' from first anchor "
+                      "'%s' via %s", control_condition, first_anchor, source)
+
+        # 5. statistics 
+        LOG.info("Running statistics vs. control condition '%s'", control_condition)
+        stats_results = run_all_stats(ddct_df, control_condition, args.alpha)
+    else:
+        LOG.info("No --housekeeping given: skipping ddCt/RQ/log2FC and statistics -- "
+                  "QC and raw Cq outputs only.")
 
     # 6. write tables 
     tables_dir = args.outdir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
     replicate_log.to_csv(tables_dir / "technical_replicates_QC.csv", index=False)
     group_summary.to_csv(tables_dir / "sample_target_Cq_summary.csv", index=False)
-    ddct_df.to_csv(tables_dir / "ddCt_RQ_log2FC_results.csv", index=False)
 
-    posthoc_frames = []
-    for target, res in stats_results.items():
-        if res.posthoc is not None and not res.posthoc.empty:
-            f = res.posthoc.copy()
-            f.insert(0, "Target", target)
-            f.insert(1, "Control_condition", res.control_condition)
-            f.insert(2, "Test_family", res.test_family)
-            f.insert(3, "Omnibus_test", res.omnibus_test)
-            f.insert(4, "Omnibus_p", res.omnibus_p)
-            posthoc_frames.append(f)
-    if posthoc_frames:
-        pd.concat(posthoc_frames, ignore_index=True).to_csv(
-            tables_dir / "statistics_posthoc.csv", index=False)
-    write_stats_report(stats_results, tables_dir / "statistics_report.txt")
+    if ddct_df is not None:
+        ddct_df.to_csv(tables_dir / "ddCt_RQ_log2FC_results.csv", index=False)
+
+        posthoc_frames = []
+        for target, res in stats_results.items():
+            if res.posthoc is not None and not res.posthoc.empty:
+                f = res.posthoc.copy()
+                f.insert(0, "Target", target)
+                f.insert(1, "Control_condition", res.control_condition)
+                f.insert(2, "Test_family", res.test_family)
+                f.insert(3, "Omnibus_test", res.omnibus_test)
+                f.insert(4, "Omnibus_p", res.omnibus_p)
+                posthoc_frames.append(f)
+        if posthoc_frames:
+            pd.concat(posthoc_frames, ignore_index=True).to_csv(
+                tables_dir / "statistics_posthoc.csv", index=False)
+        write_stats_report(stats_results, tables_dir / "statistics_report.txt")
 
     # 7. plots 
     LOG.info("Generating plots")
     plot_qc_replicates(replicate_log, args.outdir / "plots" / "qc", args.dpi)
     plot_cq_by_sample(group_summary, anchor_by_plate, args.outdir / "plots" / "cq", args.dpi)
-    plot_log2fc(ddct_df, stats_results, control_condition, args.outdir / "plots" / "log2fc", args.dpi)
+    if ddct_df is not None:
+        plot_log2fc(ddct_df, stats_results, control_condition, args.outdir / "plots" / "log2fc", args.dpi)
 
     LOG.info("Done. Results written to %s", args.outdir.resolve())
     print(f"\nDone. See:\n  {tables_dir}\n  {args.outdir / 'plots'}\n  {log_path}")
