@@ -17,6 +17,13 @@ WORKFLOW
      - if only 2 replicates remain and SD is still > threshold -> the
        whole (sample, target) group FAILS QC (but allow exploration later)
    The SD threshold is a user parsed CLI argument (--sd-threshold).
+   Biological condition + replicate id are resolved per Sample using, in
+   priority order: an explicit --sample-map CSV, then DA3's own 'Biogroup'
+   field (Replicate Group Result sheet) if it was actually populated during
+   plate setup, then a regex on the Sample text (--condition-regex, default:
+   a trailing " <number>"). Sample names do NOT need to encode the replicate
+   number themselves as long as DA3's Biogroup field was set, or you supply
+   --sample-map.
 3. In "exploratory" mode (--exploratory), failed (sample, target) groups
    can be salvaged instead of dropped, using one of several strategies
    (--fail-strategy): plate_mean, anchor_mean, best_subset, or drop.
@@ -83,6 +90,10 @@ import seaborn as sns
 
 from scipy import stats as sstats
 
+try:
+    import scikit_posthocs as sp
+except ImportError:  # pragma: no cover
+    sp = None
 
 sns.set_theme(style="whitegrid", context="talk")
 
@@ -147,20 +158,110 @@ def read_plate_results(path: Path, plate_label: str) -> pd.DataFrame:
     return df[keep_cols].reset_index(drop=True)
 
 
-# 2. Condition / biological-replicate parsing #has to e named accordingly
+# 2. Condition / biological-replicate resolution (Sample does NOT have to be
+#    named with a trailing replicate number -- see ConditionResolver below)
 
-TRAILING_NUMBER_RE = re.compile(r"^(?P<condition>.*?)\s+(?P<rep>\d+)$")
+DEFAULT_CONDITION_REGEX = r"^(?P<condition>.*?)\s+(?P<rep>\d+)$"
 
-def parse_condition(sample: str) -> tuple[str, str]:
-    """Split a Sample label like 'CRISPRoff-HER2 3' into ('CRISPRoff-HER2', '3').
 
-    If the Sample has no trailing replicate number, the whole string is
-    treated as the condition and the replicate id defaults to '1'.
+def find_generic_header_row(ws, first_cell_options: set[str]) -> Optional[int]:
+    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row and row[0] in first_cell_options:
+            return i
+    return None
+
+
+def read_biogroup_map(path: Path) -> dict:
+    """Read DA3's own biological-replicate grouping, if it was actually used.
+
+    QuantStudio Design & Analysis (DA3) exports a 'Replicate Group Result'
+    sheet with a 'Biogroup' column, populated only if a "Biological Group"
+    was assigned during plate setup in the DA3 app -- independent of the
+    free-text 'Sample' name. If that field was never set, the column is
+    entirely empty and this returns {}, so the caller falls back to
+    --sample-map / --condition-regex.
     """
-    m = TRAILING_NUMBER_RE.match(sample)
-    if m:
-        return m.group("condition"), m.group("rep")
-    return sample, "1"
+    import openpyxl
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wb = openpyxl.load_workbook(path, data_only=True)
+
+    if "Replicate Group Result" not in wb.sheetnames:
+        return {}
+    ws = wb["Replicate Group Result"]
+    header_row = find_generic_header_row(ws, {"Sample"})
+    if header_row is None:
+        return {}
+    headers = [c.value for c in ws[header_row]]
+    if "Sample" not in headers or "Biogroup" not in headers:
+        return {}
+    sample_idx = headers.index("Sample")
+    biogroup_idx = headers.index("Biogroup")
+
+    mapping = {}
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        if row[sample_idx] is None:
+            continue
+        bg = row[biogroup_idx]
+        if bg is not None and str(bg).strip() != "":
+            mapping[str(row[sample_idx]).strip()] = str(bg).strip()
+    return mapping
+
+
+def load_sample_map(path: Path) -> pd.DataFrame:
+    """Explicit Sample -> Condition/BioRep override table (columns: Sample,
+    Condition, BioRep, and an optional Plate column -- blank Plate matches
+    any plate). Highest-priority resolution source; use this when Sample
+    names carry no replicate info at all and DA3's Biogroup wasn't set.
+    """
+    df = pd.read_csv(path, dtype=str)
+    required = {"Sample", "Condition", "BioRep"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"--sample-map {path}: missing required column(s): {missing}")
+    if "Plate" not in df.columns:
+        df["Plate"] = np.nan
+    return df
+
+
+class ConditionResolver:
+    """Resolves (plate, sample) -> (condition, bio_rep, source).
+
+    Priority, highest first:
+      1. an explicit --sample-map entry (per-plate, or wildcard across plates)
+      2. DA3's own Biogroup field (per plate), when it was actually populated
+      3. a regex applied to the Sample string (default or --condition-regex)
+    """
+
+    def __init__(self, sample_map: Optional[pd.DataFrame], biogroup_maps: dict,
+                 condition_regex: str):
+        self.sample_map = sample_map
+        self.biogroup_maps = biogroup_maps  # plate -> {sample: biogroup}
+        self.regex = re.compile(condition_regex)
+        self.used_sources = set()
+
+    def resolve(self, plate: str, sample: str) -> tuple[str, str, str]:
+        if self.sample_map is not None:
+            hit = self.sample_map[
+                (self.sample_map["Sample"] == sample) &
+                (self.sample_map["Plate"].isna() | (self.sample_map["Plate"] == plate))
+            ]
+            if not hit.empty:
+                row = hit.iloc[0]
+                self.used_sources.add("sample_map")
+                return row["Condition"], row["BioRep"], "sample_map"
+
+        bg_map = self.biogroup_maps.get(plate, {})
+        if sample in bg_map:
+            self.used_sources.add("biogroup")
+            return bg_map[sample], sample, "biogroup"
+
+        m = self.regex.match(sample)
+        self.used_sources.add("regex")
+        if m:
+            gd = m.groupdict()
+            return gd.get("condition", sample), gd.get("rep", "1"), "regex"
+        return sample, "1", "regex"
 
 
 # 3. SD-based outlier removal
@@ -246,14 +347,16 @@ def resolve_replicate_group(plate, sample, target, condition, bio_rep,
     return res
 
 
-def run_qc(raw: pd.DataFrame, sd_threshold: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-_summary : one row per (plate, sample, target) with QC outcome + Cq mean
+def run_qc(raw: pd.DataFrame, sd_threshold: float,
+           resolver: "ConditionResolver") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """replicate_log: one row per technical replicate (kept/removed, with reason).
+    group_summary: one row per (plate, sample, target) with QC outcome + Cq mean."""
     rep_rows = []
     group_rows = []
 
     grouped = raw.groupby(["Plate", "Sample", "Target"], sort=False)
     for (plate, sample, target), sub in grouped:
-        condition, bio_rep = parse_condition(sample)
+        condition, bio_rep, _source = resolver.resolve(plate, sample)
         res = resolve_replicate_group(
             plate, sample, target, condition, bio_rep,
             sub["Well Position"].tolist(), sub["Cq"].tolist(),
@@ -553,12 +656,19 @@ def run_all_stats(ddct_df: pd.DataFrame, control_condition: str, alpha: float):
 
 # 7. Plots
 
+def _sample_order(df: pd.DataFrame) -> list:
+    """Order samples by their already-resolved (Condition, BioRep), not by
+    re-parsing the Sample string."""
+    order_df = df[["Sample", "Condition", "BioRep"]].drop_duplicates()
+    order_df = order_df.sort_values(["Condition", "BioRep", "Sample"])
+    return order_df["Sample"].tolist()
+
+
 def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int):
     outdir.mkdir(parents=True, exist_ok=True)
     for plate, pdf in replicate_log.groupby("Plate"):
         targets = sorted(pdf["Target"].unique())
-        samples = sorted(pdf["Sample"].unique(),
-                          key=lambda s: parse_condition(s))
+        samples = _sample_order(pdf)
         fig, axes = plt.subplots(len(targets), 1, figsize=(max(8, 0.5 * len(samples)), 4 * len(targets)),
                                   sharex=True)
         if len(targets) == 1:
@@ -594,7 +704,7 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
     for plate, pdf in group_summary.groupby("Plate"):
         anchor_sample = anchor_by_plate.get(plate)
         targets = sorted(pdf["Target"].unique())
-        samples = sorted(pdf["Sample"].unique(), key=lambda s: parse_condition(s))
+        samples = _sample_order(pdf)
 
         for suffix, with_anchor in [("raw", False), ("with_anchor", True)]:
             fig, axes = plt.subplots(len(targets), 1,
@@ -733,8 +843,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "one per --input file in the same order.")
     p.add_argument("--control-condition", default=None,
                     help="Baseline condition group used for statistical comparisons "
-                         "(default: condition parsed from the first plate's anchor "
+                         "(default: condition resolved from the first plate's anchor "
                          "sample, e.g. 'E 1' -> 'E').")
+    p.add_argument("--condition-regex", default=DEFAULT_CONDITION_REGEX,
+                    help="Regex used to split a Sample name into biological condition "
+                         "+ replicate id when no --sample-map entry or DA3 Biogroup is "
+                         "available. Must contain a named group (?P<condition>...); a "
+                         "(?P<rep>...) group is optional (defaults to '1'). "
+                         f"Default: {DEFAULT_CONDITION_REGEX!r}")
+    p.add_argument("--sample-map", type=Path, default=None,
+                    help="Optional CSV with columns Sample,Condition,BioRep (and "
+                         "optionally Plate) to explicitly declare which biological "
+                         "condition/replicate each Sample belongs to. Takes priority "
+                         "over DA3's own Biogroup field and over --condition-regex. "
+                         "Use this when Sample names don't encode the replicate at all "
+                         "and the DA3 'Biogroup' field was not set either.")
     p.add_argument("--housekeeping", default="GAPDH",
                     help="Housekeeping gene / Target name (default: GAPDH).")
     p.add_argument("--sd-threshold", type=float, default=0.3,
@@ -783,16 +906,32 @@ def main(argv=None):
 
     anchor_by_plate = dict(zip(plate_labels, args.anchor))
 
+    sample_map = load_sample_map(args.sample_map) if args.sample_map else None
+    if sample_map is not None:
+        LOG.info("Loaded --sample-map with %d entries from %s", len(sample_map), args.sample_map)
+
     # 1. read & combine
     raw_frames = []
+    biogroup_maps = {}
     for path, label in zip(args.input, plate_labels):
         LOG.info("Reading %s as plate '%s'", path, label)
         raw_frames.append(read_plate_results(path, label))
+        bg_map = read_biogroup_map(path)
+        biogroup_maps[label] = bg_map
+        if bg_map:
+            LOG.info("Plate '%s': found DA3 Biogroup assignments for %d samples "
+                      "-> will use these over --condition-regex", label, len(bg_map))
+        else:
+            LOG.info("Plate '%s': DA3 Biogroup field is empty/unset; falling back to "
+                      "--sample-map (if given) then --condition-regex", label)
     raw = pd.concat(raw_frames, ignore_index=True)
+
+    resolver = ConditionResolver(sample_map, biogroup_maps, args.condition_regex)
 
     # 2. QC / outlier resolution 
     LOG.info("Running SD-based outlier resolution (threshold=%s)", args.sd_threshold)
-    replicate_log, group_summary = run_qc(raw, args.sd_threshold)
+    replicate_log, group_summary = run_qc(raw, args.sd_threshold, resolver)
+    LOG.info("Condition/replicate resolution sources used: %s", sorted(resolver.used_sources))
 
     n_failed = (group_summary["QC_status"] == "FAILED").sum()
     LOG.info("QC complete: %d/%d (sample, target) groups FAILED",
@@ -811,10 +950,10 @@ def main(argv=None):
 
     control_condition = args.control_condition
     if control_condition is None:
-        first_anchor = args.anchor[0]
-        control_condition, _ = parse_condition(first_anchor)
-        LOG.info("--control-condition not given; inferred '%s' from first anchor '%s'",
-                  control_condition, first_anchor)
+        first_plate, first_anchor = plate_labels[0], args.anchor[0]
+        control_condition, _, source = resolver.resolve(first_plate, first_anchor)
+        LOG.info("--control-condition not given; resolved '%s' from first anchor "
+                  "'%s' via %s", control_condition, first_anchor, source)
 
     # 5. statistics 
     LOG.info("Running statistics vs. control condition '%s'", control_condition)
