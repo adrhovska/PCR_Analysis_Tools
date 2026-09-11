@@ -74,6 +74,10 @@ WORKFLOW
    position on the plate (first well occupied, row letter then column
    number) rather than alphabetically or by condition -- matches the
    plate layout, which makes visual interpretation easier.
+   Plot titles are kept short ("QC -- {plate}", "{plate} -- Cq",
+   "{target} vs {control}") so they fit at the default figure size; if a
+   plate label or target name is still unusually long, the figure widens
+   itself just enough to fit the title rather than clipping it.
 
 USAGE (PARSING CLI)
     python qpcr_pipeline.py \\
@@ -779,6 +783,44 @@ def _sample_order(df: pd.DataFrame) -> list:
     return order_df["Sample"].tolist()
 
 
+def _fit_title_and_layout(fig, title_artist, ax=None, tight_kwargs: Optional[dict] = None,
+                           margin_in: float = 0.5, max_iter: int = 4) -> None:
+    """Widen `fig` in place, re-running tight_layout, until `title_artist`
+    (from fig.suptitle(...) or ax.set_title(...)) fits within its reference
+    width -- otherwise long plate/sample/target names get clipped or run off
+    the edge of the saved image.
+
+    A fig.suptitle(...) is centered on the whole FIGURE, so pass ax=None to
+    compare its width against the figure width. An ax.set_title(...) is
+    centered on that AXES (which is narrower than the figure once axis
+    labels/ticks take up their own margin), so pass that ax -- comparing
+    against the figure width alone under-widens and the title still clips.
+
+    Call this once after setting the title, in place of a bare
+    fig.tight_layout() call; it runs tight_layout itself (repeatedly, if
+    needed) so the caller only needs to fig.savefig() afterwards."""
+    tight_kwargs = tight_kwargs or {}
+    if title_artist is None:
+        fig.tight_layout(**tight_kwargs)
+        return
+    fig.tight_layout(**tight_kwargs)
+    for _ in range(max_iter):
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            title_w_in = title_artist.get_window_extent(renderer=renderer).width / fig.dpi
+            ref_w_in = (ax.get_window_extent(renderer=renderer).width / fig.dpi
+                        if ax is not None else fig.get_size_inches()[0])
+        except Exception:
+            return
+        deficit_in = title_w_in - ref_w_in
+        if deficit_in <= 0:
+            return
+        cur_w, cur_h = fig.get_size_inches()
+        fig.set_size_inches(cur_w + deficit_in + margin_in, cur_h, forward=True)
+        fig.tight_layout(**tight_kwargs)
+
+
 def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int,
                         plate_sample_order: Optional[dict] = None):
     outdir.mkdir(parents=True, exist_ok=True)
@@ -805,11 +847,11 @@ def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int,
 
         handles, labels = axes[0].get_legend_handles_labels()
         plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-        fig.suptitle(f"QC: Cq per technical replicate - {plate}", y=0.995)
+        sup = fig.suptitle(f"QC - {plate}", y=0.995)
         if handles:
             fig.legend(handles[:1], labels[:1], loc="lower center",
                        bbox_to_anchor=(0.5, 0.0), ncol=1)
-        fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+        _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0.05, 1, 0.96]))
         fig.savefig(outdir / f"qc_replicates_{plate}.png", dpi=dpi)
         plt.close(fig)
 
@@ -848,9 +890,9 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
                 ax.set_ylabel(f"{target}\nCq (mean \u00b1 SD)")
                 ax.grid(True, alpha=0.3)
             plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-            title = f"Cq per sample - {plate}" + (" (anchor highlighted)" if with_anchor else " (raw)")
-            fig.suptitle(title)
-            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            title = f"{plate} = Cq" + (" (anchor)" if with_anchor else "")
+            sup = fig.suptitle(title)
+            _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.97]))
             fig.savefig(outdir / f"cq_by_sample_{suffix}_{plate}.png", dpi=dpi)
             plt.close(fig)
 
@@ -893,7 +935,7 @@ def plot_log2fc(ddct_df: pd.DataFrame, stats_results: dict, control_condition: s
         ax.set_xticks(range(len(order)))
         ax.set_xticklabels(order, rotation=60, ha="right")
         ax.set_ylabel("log2FC")
-        ax.set_title(f"{target} - log2FC vs. {control_condition}")
+        ax_title = ax.set_title(f"{target} vs {control_condition}")
 
         res = stats_results.get(target)
         if res is not None and res.posthoc is not None and not res.posthoc.empty:
@@ -912,7 +954,7 @@ def plot_log2fc(ddct_df: pd.DataFrame, stats_results: dict, control_condition: s
             ax.text(0.01, 0.02, f"{fam}\n{omni}", transform=ax.transAxes,
                      ha="left", va="bottom", fontsize=9, color="dimgray")
 
-        fig.tight_layout()
+        _fit_title_and_layout(fig, ax_title, ax=ax)
         safe_target = re.sub(r"[^\w\-.]", "_", target)
         fig.savefig(outdir / f"log2FC_{safe_target}.png", dpi=dpi)
         plt.close(fig)
