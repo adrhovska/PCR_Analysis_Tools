@@ -712,7 +712,7 @@ def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int):
 
         handles, labels = axes[0].get_legend_handles_labels()
         plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-        fig.suptitle(f"QC: Cq per technical replicate — {plate}", y=0.995)
+        fig.suptitle(f"QC: Cq per technical replicate - {plate}", y=0.995)
         if handles:
             fig.legend(handles[:1], labels[:1], loc="lower center",
                        bbox_to_anchor=(0.5, 0.0), ncol=1)
@@ -754,7 +754,7 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
                 ax.set_ylabel(f"{target}\nCq (mean \u00b1 SD)")
                 ax.grid(True, alpha=0.3)
             plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-            title = f"Cq per sample — {plate}" + (" (anchor highlighted)" if with_anchor else " (raw)")
+            title = f"Cq per sample - {plate}" + (" (anchor highlighted)" if with_anchor else " (raw)")
             fig.suptitle(title)
             fig.tight_layout(rect=[0, 0, 1, 0.97])
             fig.savefig(outdir / f"cq_by_sample_{suffix}_{plate}.png", dpi=dpi)
@@ -799,7 +799,7 @@ def plot_log2fc(ddct_df: pd.DataFrame, stats_results: dict, control_condition: s
         ax.set_xticks(range(len(order)))
         ax.set_xticklabels(order, rotation=60, ha="right")
         ax.set_ylabel("log2FC")
-        ax.set_title(f"{target} — log2FC vs. {control_condition}")
+        ax.set_title(f"{target} - log2FC vs. {control_condition}")
 
         res = stats_results.get(target)
         if res is not None and res.posthoc is not None and not res.posthoc.empty:
