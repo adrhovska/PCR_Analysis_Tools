@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-qPCR analysis tool which employs the updated SD-based replicate removal method.
+qPCR analysis tool which employs the updated SD-based replicate removal method
+(optionally skippable via --skip-outlier-removal, see step 2 below).
 Allows for exploratory imputation of failed (sample, target) groups using several strategies.
 Includes statistical testing (parametric or non-parametric) and plotting of results.
 
@@ -34,11 +35,24 @@ WORKFLOW
    This is most useful for housekeeping genes, where losing a sample
    entirely because of one bad technical replicate is wasteful but
    exploratory imputation is reasonable/desired.
-4. Computes the ddCt method per plate, using a user-specified anchor
-   SAMPLE (one specific well/biological replicate used as the calibrator,
-   e.g. "Empty 1") and housekeeping gene (default GAPDH):
-       dCt        = Cq(target) - Cq(housekeeping)
-       ddCt       = dCt(sample) - dCt(anchor)
+4. Computes ddCt per plate, referenced to a user-specified anchor SAMPLE
+   (one specific well/biological replicate used as the calibrator, e.g.
+   "Empty 1" or "Church wt"). Giving --anchor is what triggers this step
+   (and step 5) at all -- omit it entirely to get QC + raw Cq outputs only.
+   Two modes, depending on whether --housekeeping is also given:
+     - WITH a housekeeping gene (e.g. GAPDH) -- the standard two-step method:
+           dCt        = Cq(target) - Cq(housekeeping)
+           ddCt       = dCt(sample) - dCt(anchor)
+     - WITHOUT a housekeeping gene (--housekeeping omitted) -- ddCt is taken
+       directly off each target's own Cq, with no reference-gene
+       normalization step at all:
+           dCt        = Cq(target)          (no housekeeping subtraction)
+           ddCt       = dCt(sample) - dCt(anchor)
+       Use this mode when there is no housekeeping/endogenous-control assay
+       on the plate by design -- e.g. template input was already equalized
+       another way (Qubit-based dilution to a fixed ng amount), so forcing a
+       reference-gene normalization would just add noise rather than remove it.
+   Either way:
        RQ         = 2^-ddCt
        log2FC     = -ddCt   (== log2(RQ))
 5. Runs group-wise statistics on log2FC per target vs. a control condition
@@ -56,6 +70,10 @@ WORKFLOW
      - cq/             Cq per sample per target, raw and anchor-referenced
      - log2fc/         log2FC per condition per target with significance
                        brackets vs. the control condition
+   In qc/ and cq/, samples are ordered left-to-right by their physical
+   position on the plate (first well occupied, row letter then column
+   number) rather than alphabetically or by condition -- matches the
+   plate layout, which makes visual interpretation easier.
 
 USAGE (PARSING CLI)
     python qpcr_pipeline.py \\
@@ -66,6 +84,25 @@ USAGE (PARSING CLI)
         --sd-threshold 0.3 \\
         --exploratory --fail-strategy plate_mean \\
         --outdir ./qpcr_results
+
+    # Same run, but skip SD-based outlier removal entirely (average every
+    # valid replicate as-is; --sd-threshold is ignored) and go straight to ddCt:
+    python qpcr_pipeline.py \\
+        --input plate1.xlsx plate2.xlsx plate3.xlsx \\
+        --plate-labels Plate1 Plate2 Plate3 \\
+        --anchor "Empty 1" "E 1" "E 1" \\
+        --housekeeping GAPDH \\
+        --skip-outlier-removal \\
+        --outdir ./qpcr_results_no_qc
+
+    # No housekeeping/endogenous-control assay at all (e.g. a Golden Gate
+    # cutting-efficiency plate where template was Qubit-normalized): give
+    # --anchor and simply omit --housekeeping -- ddCt is then computed
+    # directly off each target's own Cq vs. the anchor sample:
+    python qpcr_pipeline.py \\
+        --input plate1.xlsx \\
+        --anchor "Church wt" \\
+        --outdir ./qpcr_results_no_housekeeping
 
 Run `python qpcr_pipeline.py --help` for the full argument list.
 
@@ -284,7 +321,7 @@ class ReplicateResolution:
     removed_reasons: list = field(default_factory=list)
     n_start: int = 0
     final_sd: Optional[float] = None
-    status: str = "PASS"         
+    status: str = "PASS"          # PASS | PASS_AFTER_REMOVAL | PASS_NO_QC | FAILED
     fail_reason: Optional[str] = None
     cq_mean: Optional[float] = None
     imputed: bool = False
@@ -486,8 +523,21 @@ def apply_fail_strategy(group_summary: pd.DataFrame, raw: pd.DataFrame,
 
 # 5. ddCt method
 
-def compute_ddct(group_summary: pd.DataFrame, housekeeping: str,
+def compute_ddct(group_summary: pd.DataFrame, housekeeping: Optional[str],
                   anchor_by_plate: dict) -> pd.DataFrame:
+    """ddCt vs. an anchor sample, per plate.
+
+    If `housekeeping` is given, the standard two-step method is used:
+        dCt  = Cq(target) - Cq(housekeeping)
+        ddCt = dCt(sample) - dCt(anchor)
+
+    If `housekeeping` is None, there is no reference-gene normalization step:
+    each target's own Cq is used directly (dCt == Cq(target)) and ddCt is
+    just Cq(target, sample) - Cq(target, anchor). This is the correct mode
+    for experiments with no housekeeping/endogenous-control assay -- e.g.
+    when template input was already equalized by another method (Qubit
+    quantification, etc.) so no internal normalizer is needed or wanted.
+    """
     rows = []
 
     for plate, plate_df in group_summary.groupby("Plate"):
@@ -495,28 +545,43 @@ def compute_ddct(group_summary: pd.DataFrame, housekeeping: str,
         if anchor_sample is None:
             raise ValueError(f"No anchor sample specified for plate '{plate}'.")
 
-        hk = plate_df[plate_df["Target"] == housekeeping].set_index("Sample")["Cq_mean"]
-        targets = sorted(t for t in plate_df["Target"].unique() if t != housekeeping)
+        if housekeeping is not None:
+            hk = plate_df[plate_df["Target"] == housekeeping].set_index("Sample")["Cq_mean"]
+            targets = sorted(t for t in plate_df["Target"].unique() if t != housekeeping)
+        else:
+            hk = None
+            targets = sorted(plate_df["Target"].unique())
 
         anchor_dct = {}
         for target in targets:
             tgt_series = plate_df[plate_df["Target"] == target].set_index("Sample")["Cq_mean"]
-            if anchor_sample not in tgt_series.index or anchor_sample not in hk.index:
+            if anchor_sample not in tgt_series.index:
                 anchor_dct[target] = np.nan
                 continue
-            anchor_dct[target] = tgt_series[anchor_sample] - hk[anchor_sample]
+            if housekeeping is not None:
+                if anchor_sample not in hk.index:
+                    anchor_dct[target] = np.nan
+                    continue
+                anchor_dct[target] = tgt_series[anchor_sample] - hk[anchor_sample]
+            else:
+                anchor_dct[target] = tgt_series[anchor_sample]
 
         for target in targets:
             tgt_df = plate_df[plate_df["Target"] == target]
-            hk_df = plate_df[plate_df["Target"] == housekeeping]
+            hk_df = plate_df[plate_df["Target"] == housekeeping] if housekeeping is not None else None
 
             for _, row in tgt_df.iterrows():
                 sample = row["Sample"]
-                hk_row = hk_df[hk_df["Sample"] == sample]
-                cq_hk = hk_row["Cq_mean"].iloc[0] if not hk_row.empty else np.nan
                 cq_tgt = row["Cq_mean"]
 
-                dct = cq_tgt - cq_hk if pd.notna(cq_tgt) and pd.notna(cq_hk) else np.nan
+                if housekeeping is not None:
+                    hk_row = hk_df[hk_df["Sample"] == sample]
+                    cq_hk = hk_row["Cq_mean"].iloc[0] if not hk_row.empty else np.nan
+                    dct = cq_tgt - cq_hk if pd.notna(cq_tgt) and pd.notna(cq_hk) else np.nan
+                else:
+                    cq_hk = np.nan
+                    dct = cq_tgt if pd.notna(cq_tgt) else np.nan
+
                 a_dct = anchor_dct.get(target, np.nan)
                 ddct = dct - a_dct if pd.notna(dct) and pd.notna(a_dct) else np.nan
                 rq = 2 ** (-ddct) if pd.notna(ddct) else np.nan
@@ -525,7 +590,9 @@ def compute_ddct(group_summary: pd.DataFrame, housekeeping: str,
                 rows.append(dict(
                     Plate=plate, Sample=sample, Condition=row["Condition"],
                     BioRep=row["BioRep"], Target=target,
-                    Anchor_sample=anchor_sample, Housekeeping_gene=housekeeping,
+                    Anchor_sample=anchor_sample,
+                    Housekeeping_gene=(housekeeping if housekeeping is not None
+                                        else "none (direct Ct vs anchor)"),
                     Cq_target_mean=cq_tgt, Cq_target_SD=row["Cq_SD"],
                     Cq_housekeeping_mean=cq_hk,
                     QC_status_target=row["QC_status"], Imputed_target=row["Imputed"],
@@ -679,19 +746,45 @@ def run_all_stats(ddct_df: pd.DataFrame, control_condition: str, alpha: float):
 
 # 7. Plots
 
+def _well_sort_key(well) -> tuple:
+    """Sort key for a well position like 'A1', 'B12', ... by row letter then
+    numeric column, so 'A2' sorts before 'A10' (unlike plain string sort)."""
+    m = re.match(r"^([A-Za-z]+)0*(\d+)$", str(well).strip())
+    if not m:
+        return (str(well), 0)
+    row, col = m.groups()
+    return (row, int(col))
+
+
+def compute_plate_sample_order(raw: pd.DataFrame) -> dict:
+    """Map each plate -> samples ordered by their first well position on the
+    physical plate (row letter then column number), i.e. the order the
+    samples actually appear on the plate rather than an alphabetical or
+    condition-based order. Used so plots read left-to-right the same way the
+    plate is laid out, which makes visual QC/interpretation easier."""
+    tmp = raw.copy()
+    tmp["_well_key"] = tmp["Well Position"].map(_well_sort_key)
+    order = {}
+    for plate, pdf in tmp.groupby("Plate", sort=False):
+        first_key = pdf.groupby("Sample")["_well_key"].min()
+        order[plate] = first_key.sort_values().index.tolist()
+    return order
+
+
 def _sample_order(df: pd.DataFrame) -> list:
-    """Order samples by their already-resolved (Condition, BioRep), not by
-    re-parsing the Sample string."""
+    """Fallback ordering (by already-resolved Condition, BioRep) for when no
+    plate-layout order is available. Prefer compute_plate_sample_order()."""
     order_df = df[["Sample", "Condition", "BioRep"]].drop_duplicates()
     order_df = order_df.sort_values(["Condition", "BioRep", "Sample"])
     return order_df["Sample"].tolist()
 
 
-def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int):
+def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int,
+                        plate_sample_order: Optional[dict] = None):
     outdir.mkdir(parents=True, exist_ok=True)
     for plate, pdf in replicate_log.groupby("Plate"):
         targets = sorted(pdf["Target"].unique())
-        samples = _sample_order(pdf)
+        samples = (plate_sample_order or {}).get(plate) or _sample_order(pdf)
         fig, axes = plt.subplots(len(targets), 1, figsize=(max(8, 0.5 * len(samples)), 4 * len(targets)),
                                   sharex=True)
         if len(targets) == 1:
@@ -722,12 +815,13 @@ def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int):
 
 
 def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
-                       outdir: Path, dpi: int):
+                       outdir: Path, dpi: int,
+                       plate_sample_order: Optional[dict] = None):
     outdir.mkdir(parents=True, exist_ok=True)
     for plate, pdf in group_summary.groupby("Plate"):
         anchor_sample = anchor_by_plate.get(plate)
         targets = sorted(pdf["Target"].unique())
-        samples = _sample_order(pdf)
+        samples = (plate_sample_order or {}).get(plate) or _sample_order(pdf)
 
         variants = [("raw", False)]
         if anchor_sample is not None:
@@ -866,12 +960,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Custom plate labels, matched by order to --input "
                          "(default: file stem).")
     p.add_argument("--anchor", nargs="+", default=None,
-                    help="Anchor SAMPLE name (exact 'Sample' text, e.g. 'Empty 1'), "
-                         "one per --input file in the same order. Required if "
-                         "--housekeeping is set (needed for the ddCt calculation); "
-                         "optional otherwise -- if given without --housekeeping, it "
-                         "only highlights that sample as a reference line in the "
-                         "'with_anchor' Cq plot, no ddCt math is done.")
+                    help="Anchor/calibrator SAMPLE name (exact 'Sample' text, e.g. "
+                         "'Empty 1' or 'Church wt'), one per --input file in the same "
+                         "order. Giving --anchor is what triggers ddCt/RQ/log2FC + "
+                         "statistics: with --housekeeping also set, ddCt uses the "
+                         "standard dCt(target)-dCt(housekeeping) method referenced to "
+                         "the anchor; without --housekeeping, ddCt is computed directly "
+                         "from each target's own Cq referenced to the anchor (no "
+                         "reference-gene normalization) -- appropriate when template "
+                         "input was already equalized another way (e.g. Qubit-based "
+                         "dilution), so there is no housekeeping/endogenous-control "
+                         "assay on the plate. If --anchor is omitted entirely, no ddCt "
+                         "math is done at all (QC + raw Cq outputs only).")
     p.add_argument("--control-condition", default=None,
                     help="Baseline condition group used for statistical comparisons "
                          "(default: condition resolved from the first plate's anchor "
@@ -890,13 +990,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "Use this when Sample names don't encode the replicate at all "
                          "and the DA3 'Biogroup' field was not set either.")
     p.add_argument("--housekeeping", default=None,
-                    help="Housekeeping gene / Target name for the ddCt method "
-                         "(e.g. GAPDH). Omit this entirely for experiments that "
-                         "don't have a relative-quantification reference gene "
-                         "(e.g. a cloning/junction-validation qPCR) -- the pipeline "
-                         "then runs QC + raw Cq plots only and skips ddCt/RQ/log2FC "
-                         "and the statistics step, rather than forcing a fake "
-                         "normalization that would just produce all-NaN results.")
+                    help="Housekeeping gene / Target name for the standard two-step "
+                         "ddCt method (e.g. GAPDH). Omit this for experiments with no "
+                         "relative-quantification reference gene: if --anchor is still "
+                         "given, ddCt is computed directly against the anchor's own Cq "
+                         "per target (no housekeeping subtraction) -- the right mode "
+                         "when input was already equalized some other way (e.g. Qubit "
+                         "dilution), so a fake reference-gene normalization would just "
+                         "add noise. If --anchor is also omitted, the pipeline runs QC "
+                         "+ raw Cq plots only and skips ddCt/RQ/log2FC and statistics "
+                         "entirely.")
     p.add_argument("--sd-threshold", type=float, default=0.3,
                     help="Max allowed technical-replicate Cq SD before outlier "
                          "removal kicks in (default: 0.3). Ignored if "
@@ -999,13 +1102,19 @@ def main(argv=None):
         n_imputed = group_summary["Imputed"].sum()
         LOG.info("Exploratory mode ('%s'): %d groups imputed", args.fail_strategy, n_imputed)
 
-    # 4. ddCt (skipped entirely if --housekeeping was not given)
+    # 4. ddCt (skipped entirely if --anchor was not given; --housekeeping just
+    #    switches between the two-step and direct-vs-anchor ddCt method)
     ddct_df = None
     stats_results = {}
     control_condition = None
 
-    if args.housekeeping is not None:
-        LOG.info("Computing ddCt / RQ / log2FC (housekeeping=%s)", args.housekeeping)
+    if args.anchor:
+        if args.housekeeping is not None:
+            LOG.info("Computing ddCt / RQ / log2FC (housekeeping=%s, referenced to anchor)",
+                      args.housekeeping)
+        else:
+            LOG.info("Computing ddCt / RQ / log2FC directly vs. anchor (no --housekeeping "
+                      "given -- dCt = Cq(target) itself, no reference-gene normalization)")
         ddct_df = compute_ddct(group_summary, args.housekeeping, anchor_by_plate)
 
         control_condition = args.control_condition
@@ -1015,11 +1124,11 @@ def main(argv=None):
             LOG.info("--control-condition not given; resolved '%s' from first anchor "
                       "'%s' via %s", control_condition, first_anchor, source)
 
-        # 5. statistics 
+        # 5. statistics
         LOG.info("Running statistics vs. control condition '%s'", control_condition)
         stats_results = run_all_stats(ddct_df, control_condition, args.alpha)
     else:
-        LOG.info("No --housekeeping given: skipping ddCt/RQ/log2FC and statistics -- "
+        LOG.info("No --anchor given: skipping ddCt/RQ/log2FC and statistics -- "
                   "QC and raw Cq outputs only.")
 
     # 6. write tables 
@@ -1046,10 +1155,13 @@ def main(argv=None):
                 tables_dir / "statistics_posthoc.csv", index=False)
         write_stats_report(stats_results, tables_dir / "statistics_report.txt")
 
-    # 7. plots 
+    # 7. plots
     LOG.info("Generating plots")
-    plot_qc_replicates(replicate_log, args.outdir / "plots" / "qc", args.dpi)
-    plot_cq_by_sample(group_summary, anchor_by_plate, args.outdir / "plots" / "cq", args.dpi)
+    plate_sample_order = compute_plate_sample_order(raw)
+    plot_qc_replicates(replicate_log, args.outdir / "plots" / "qc", args.dpi,
+                        plate_sample_order=plate_sample_order)
+    plot_cq_by_sample(group_summary, anchor_by_plate, args.outdir / "plots" / "cq", args.dpi,
+                       plate_sample_order=plate_sample_order)
     if ddct_df is not None:
         plot_log2fc(ddct_df, stats_results, control_condition, args.outdir / "plots" / "log2fc", args.dpi)
 
