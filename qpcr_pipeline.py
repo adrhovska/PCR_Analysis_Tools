@@ -69,7 +69,10 @@ WORKFLOW
                        removed points marked (X), faceted by target
      - cq/             Cq per sample per target, raw and anchor-referenced
      - log2fc/         log2FC per condition per target with significance
-                       brackets vs. the control condition
+                       brackets vs. the control condition -- one file per
+                       target (log2FC_<target>.png) plus a single combined
+                       figure with all targets side by side
+                       (log2FC_all_targets.png)
    In qc/ and cq/, samples are ordered left-to-right by their physical
    position on the plate (first well occupied, row letter then column
    number) rather than alphabetically or by condition -- matches the
@@ -890,7 +893,7 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
                 ax.set_ylabel(f"{target}\nCq (mean \u00b1 SD)")
                 ax.grid(True, alpha=0.3)
             plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-            title = f"{plate} = Cq" + (" (anchor)" if with_anchor else "")
+            title = f"{plate} - Cq" + (" (anchor)" if with_anchor else "")
             sup = fig.suptitle(title)
             _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.97]))
             fig.savefig(outdir / f"cq_by_sample_{suffix}_{plate}.png", dpi=dpi)
@@ -915,49 +918,87 @@ def _draw_significance_brackets(ax, x_positions: dict, control: str,
         level += 1
 
 
+def _draw_log2fc_panel(ax, sub: pd.DataFrame, control_condition: str,
+                        res: Optional["TargetStatsResult"], title: str) -> None:
+    """Draw one target's log2FC stripplot (+ mean markers, significance
+    brackets vs. control, test-family annotation) onto an existing Axes.
+    Shared by plot_log2fc (one file per target) and plot_log2fc_combined
+    (all targets side by side in a single figure) so the two stay visually
+    identical."""
+    order = sorted(sub["Condition"].unique(),
+                    key=lambda c: (c != control_condition, c))
+    x_positions = {c: i for i, c in enumerate(order)}
+
+    sns.stripplot(data=sub, x="Condition", y="log2FC", order=order,
+                   ax=ax, size=8, jitter=0.15, alpha=0.85)
+    means = sub.groupby("Condition")["log2FC"].mean().reindex(order)
+    ax.scatter(range(len(order)), means, color="black", marker="_", s=800, zorder=5)
+    ax.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(order, rotation=60, ha="right")
+    ax.set_ylabel("log2FC")
+    ax.set_title(title)
+
+    if res is not None and res.posthoc is not None and not res.posthoc.empty:
+        data_min, data_max = sub["log2FC"].min(), sub["log2FC"].max()
+        data_range = max(data_max - data_min, 0.5)
+        y_top = data_max + 0.15 * data_range
+        y_step = 0.14 * data_range
+        n_brackets = len(res.posthoc)
+        _draw_significance_brackets(ax, x_positions, control_condition,
+                                     res.posthoc, y_top, y_step)
+        ax.set_ylim(data_min - 0.15 * data_range,
+                    y_top + (n_brackets + 0.8) * y_step)
+
+        fam = res.test_family
+        omni = f"{res.omnibus_test}: p={res.omnibus_p:.4g}" if res.omnibus_p is not None else ""
+        ax.text(0.01, 0.02, f"{fam}\n{omni}", transform=ax.transAxes,
+                 ha="left", va="bottom", fontsize=9, color="dimgray")
+
+
 def plot_log2fc(ddct_df: pd.DataFrame, stats_results: dict, control_condition: str,
                  outdir: Path, dpi: int):
+    """One log2FC plot per target (primer pair), each its own file."""
     outdir.mkdir(parents=True, exist_ok=True)
     for target, sub in ddct_df.groupby("Target"):
         sub = sub.dropna(subset=["log2FC"])
         if sub.empty:
             continue
-        order = sorted(sub["Condition"].unique(),
-                        key=lambda c: (c != control_condition, c))
-        x_positions = {c: i for i, c in enumerate(order)}
-
-        fig, ax = plt.subplots(figsize=(max(6, 1.3 * len(order)), 6))
-        sns.stripplot(data=sub, x="Condition", y="log2FC", order=order,
-                       ax=ax, size=8, jitter=0.15, alpha=0.85)
-        means = sub.groupby("Condition")["log2FC"].mean().reindex(order)
-        ax.scatter(range(len(order)), means, color="black", marker="_", s=800, zorder=5)
-        ax.axhline(0, color="gray", linestyle=":", linewidth=1)
-        ax.set_xticks(range(len(order)))
-        ax.set_xticklabels(order, rotation=60, ha="right")
-        ax.set_ylabel("log2FC")
-        ax_title = ax.set_title(f"{target} vs {control_condition}")
-
-        res = stats_results.get(target)
-        if res is not None and res.posthoc is not None and not res.posthoc.empty:
-            data_min, data_max = sub["log2FC"].min(), sub["log2FC"].max()
-            data_range = max(data_max - data_min, 0.5)
-            y_top = data_max + 0.15 * data_range
-            y_step = 0.14 * data_range
-            n_brackets = len(res.posthoc)
-            _draw_significance_brackets(ax, x_positions, control_condition,
-                                         res.posthoc, y_top, y_step)
-            ax.set_ylim(data_min - 0.15 * data_range,
-                        y_top + (n_brackets + 0.8) * y_step)
-
-            fam = res.test_family
-            omni = f"{res.omnibus_test}: p={res.omnibus_p:.4g}" if res.omnibus_p is not None else ""
-            ax.text(0.01, 0.02, f"{fam}\n{omni}", transform=ax.transAxes,
-                     ha="left", va="bottom", fontsize=9, color="dimgray")
-
-        _fit_title_and_layout(fig, ax_title, ax=ax)
+        n_conditions = sub["Condition"].nunique()
+        fig, ax = plt.subplots(figsize=(max(6, 1.3 * n_conditions), 6))
+        _draw_log2fc_panel(ax, sub, control_condition, stats_results.get(target),
+                            f"{target} vs {control_condition}")
+        _fit_title_and_layout(fig, ax.title, ax=ax)
         safe_target = re.sub(r"[^\w\-.]", "_", target)
         fig.savefig(outdir / f"log2FC_{safe_target}.png", dpi=dpi)
         plt.close(fig)
+
+
+def plot_log2fc_combined(ddct_df: pd.DataFrame, stats_results: dict, control_condition: str,
+                          outdir: Path, dpi: int):
+    """All targets' log2FC panels side by side in a single figure, for an
+    at-a-glance comparison across primer pairs -- in addition to (not
+    instead of) the one-file-per-target plots from plot_log2fc()."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    targets = [t for t, sub in ddct_df.groupby("Target")
+               if not sub["log2FC"].dropna().empty]
+    if not targets:
+        return
+
+    n_conditions = ddct_df["Condition"].nunique()
+    panel_w = max(5, 1.1 * n_conditions)
+    fig, axes = plt.subplots(1, len(targets), figsize=(panel_w * len(targets), 6))
+    if len(targets) == 1:
+        axes = [axes]
+
+    for ax, target in zip(axes, targets):
+        sub = ddct_df[ddct_df["Target"] == target].dropna(subset=["log2FC"])
+        _draw_log2fc_panel(ax, sub, control_condition, stats_results.get(target), target)
+
+    sup = fig.suptitle(f"log2FC vs {control_condition} - all targets", y=0.98)
+    _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.90]))
+    fig.savefig(outdir / "log2FC_all_targets.png", dpi=dpi)
+    plt.close(fig)
 
 
 # 8. Report
@@ -1206,6 +1247,8 @@ def main(argv=None):
                        plate_sample_order=plate_sample_order)
     if ddct_df is not None:
         plot_log2fc(ddct_df, stats_results, control_condition, args.outdir / "plots" / "log2fc", args.dpi)
+        plot_log2fc_combined(ddct_df, stats_results, control_condition,
+                              args.outdir / "plots" / "log2fc", args.dpi)
 
     LOG.info("Done. Results written to %s", args.outdir.resolve())
     print(f"\nDone. See:\n  {tables_dir}\n  {args.outdir / 'plots'}\n  {log_path}")
