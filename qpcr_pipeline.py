@@ -17,6 +17,10 @@ WORKFLOW
      - if only 2 replicates remain and SD is still > threshold -> the
        whole (sample, target) group FAILS QC (but allow exploration later)
    The SD threshold is a user parsed CLI argument (--sd-threshold).
+   Pass --skip-outlier-removal to bypass this step entirely: every valid
+   (non-NaN) replicate is kept and simply averaged, and a group only FAILS
+   if every replicate had no Cq at all (no amplification). --sd-threshold
+   is ignored in that mode.
    Biological condition + replicate id are resolved per Sample using, in
    priority order: an explicit --sample-map CSV, then DA3's own 'Biogroup'
    field (Replicate Group Result sheet) if it was actually populated during
@@ -280,7 +284,7 @@ class ReplicateResolution:
     removed_reasons: list = field(default_factory=list)
     n_start: int = 0
     final_sd: Optional[float] = None
-    status: str = "PASS"          # PASS | PASS_AFTER_REMOVAL | FAILED
+    status: str = "PASS"         
     fail_reason: Optional[str] = None
     cq_mean: Optional[float] = None
     imputed: bool = False
@@ -288,7 +292,8 @@ class ReplicateResolution:
 
 
 def resolve_replicate_group(plate, sample, target, condition, bio_rep,
-                             wells, cqs, sd_threshold) -> ReplicateResolution:
+                             wells, cqs, sd_threshold,
+                             skip_outlier_removal: bool = False) -> ReplicateResolution:
     res = ReplicateResolution(plate=plate, sample=sample, target=target,
                                condition=condition, bio_rep=bio_rep)
 
@@ -305,6 +310,23 @@ def resolve_replicate_group(plate, sample, target, condition, bio_rep,
 
     remaining = valid
     res.n_start = n_raw
+
+    if skip_outlier_removal:
+        # Bypass the SD-based removal loop entirely: keep every valid
+        # replicate and just average it. Only fail if nothing amplified.
+        if not remaining:
+            res.status = "FAILED"
+            res.fail_reason = "no valid Cq values (no amplification in any replicate)"
+            res.final_sd = np.nan
+        else:
+            cq_vals = np.array([c for _, c in remaining], dtype=float)
+            res.final_sd = float(np.std(cq_vals, ddof=1)) if len(cq_vals) >= 2 else np.nan
+            res.status = "PASS_NO_QC"
+        res.kept_wells = [w for w, _ in remaining]
+        res.kept_cqs = [c for _, c in remaining]
+        if remaining:
+            res.cq_mean = float(np.mean([c for _, c in remaining]))
+        return res
 
     while True:
         if len(remaining) < 2:
@@ -348,7 +370,8 @@ def resolve_replicate_group(plate, sample, target, condition, bio_rep,
 
 
 def run_qc(raw: pd.DataFrame, sd_threshold: float,
-           resolver: "ConditionResolver") -> tuple[pd.DataFrame, pd.DataFrame]:
+           resolver: "ConditionResolver",
+           skip_outlier_removal: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """replicate_log: one row per technical replicate (kept/removed, with reason).
     group_summary: one row per (plate, sample, target) with QC outcome + Cq mean."""
     rep_rows = []
@@ -360,7 +383,7 @@ def run_qc(raw: pd.DataFrame, sd_threshold: float,
         res = resolve_replicate_group(
             plate, sample, target, condition, bio_rep,
             sub["Well Position"].tolist(), sub["Cq"].tolist(),
-            sd_threshold,
+            sd_threshold, skip_outlier_removal=skip_outlier_removal,
         )
 
         for w, c in zip(res.kept_wells, res.kept_cqs):
@@ -876,7 +899,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "normalization that would just produce all-NaN results.")
     p.add_argument("--sd-threshold", type=float, default=0.3,
                     help="Max allowed technical-replicate Cq SD before outlier "
-                         "removal kicks in (default: 0.3).")
+                         "removal kicks in (default: 0.3). Ignored if "
+                         "--skip-outlier-removal is set.")
+    p.add_argument("--skip-outlier-removal", action="store_true", default=False,
+                    help="Bypass the SD-based outlier removal step entirely: every "
+                         "valid (non-NaN) technical replicate is kept and averaged "
+                         "as-is, and --sd-threshold is ignored. A (sample, target) "
+                         "group only FAILS if none of its replicates amplified at "
+                         "all. Everything downstream (ddCt/RQ/log2FC, stats, plots) "
+                         "still runs exactly as before -- use this when you just want "
+                         "the raw-mean ddCt result without SD-based QC.")
     p.add_argument("--exploratory", action="store_true", default=False, # turned off by default
                     help="Enable imputation of FAILED (sample, target) groups "
                          "instead of dropping them. Off by default (rigorous mode).")
@@ -919,8 +951,8 @@ def main(argv=None):
     LOG.info("Inputs: %s", [str(p) for p in args.input])
     LOG.info("Plate labels: %s", plate_labels)
     LOG.info("Anchors: %s", args.anchor)
-    LOG.info("SD threshold: %s | exploratory=%s | fail_strategy=%s",
-              args.sd_threshold, args.exploratory, args.fail_strategy)
+    LOG.info("SD threshold: %s | skip_outlier_removal=%s | exploratory=%s | fail_strategy=%s",
+              args.sd_threshold, args.skip_outlier_removal, args.exploratory, args.fail_strategy)
 
     anchor_by_plate = dict(zip(plate_labels, args.anchor)) if args.anchor else {}
 
@@ -946,9 +978,14 @@ def main(argv=None):
 
     resolver = ConditionResolver(sample_map, biogroup_maps, args.condition_regex)
 
-    # 2. QC / outlier resolution 
-    LOG.info("Running SD-based outlier resolution (threshold=%s)", args.sd_threshold)
-    replicate_log, group_summary = run_qc(raw, args.sd_threshold, resolver)
+    # 2. QC / outlier resolution
+    if args.skip_outlier_removal:
+        LOG.info("--skip-outlier-removal set: averaging all valid replicates per "
+                  "(sample, target) with no SD-based removal (--sd-threshold ignored)")
+    else:
+        LOG.info("Running SD-based outlier resolution (threshold=%s)", args.sd_threshold)
+    replicate_log, group_summary = run_qc(raw, args.sd_threshold, resolver,
+                                           skip_outlier_removal=args.skip_outlier_removal)
     LOG.info("Condition/replicate resolution sources used: %s", sorted(resolver.used_sources))
 
     n_failed = (group_summary["QC_status"] == "FAILED").sum()
