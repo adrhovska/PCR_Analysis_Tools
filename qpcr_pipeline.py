@@ -73,6 +73,17 @@ WORKFLOW
                        target (log2FC_<target>.png) plus a single combined
                        figure with all targets side by side
                        (log2FC_all_targets.png)
+     - rq/             the same comparison as log2fc/, drawn instead as a
+                       bar chart on the linear RQ scale: mean bar (= 2^-mean
+                       ddCt) + whiskers (+/- 1 SEM of ddCt) + individual
+                       biological-replicate points + a dashed RQ=1 line,
+                       with the same significance brackets -- one file per
+                       target (RQ_<target>.png) plus a combined figure
+                       (RQ_all_targets.png). Pass --rq-highlight-target-match
+                       to color a condition's bar differently when the
+                       target/gene name appears in the condition name (the
+                       "targets this gene" vs. "does not target this gene"
+                       convention for dCas9/CRISPRoff-style experiments).
    In qc/ and cq/, samples are ordered left-to-right by their physical
    position on the plate (first well occupied, row letter then column
    number) rather than alphabetically or by condition -- matches the
@@ -850,7 +861,7 @@ def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int,
 
         handles, labels = axes[0].get_legend_handles_labels()
         plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-        sup = fig.suptitle(f"QC - {plate}", y=0.995)
+        sup = fig.suptitle(f"QC — {plate}", y=0.995)
         if handles:
             fig.legend(handles[:1], labels[:1], loc="lower center",
                        bbox_to_anchor=(0.5, 0.0), ncol=1)
@@ -893,7 +904,7 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
                 ax.set_ylabel(f"{target}\nCq (mean \u00b1 SD)")
                 ax.grid(True, alpha=0.3)
             plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-            title = f"{plate} - Cq" + (" (anchor)" if with_anchor else "")
+            title = f"{plate} — Cq" + (" (anchor)" if with_anchor else "")
             sup = fig.suptitle(title)
             _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.97]))
             fig.savefig(outdir / f"cq_by_sample_{suffix}_{plate}.png", dpi=dpi)
@@ -995,9 +1006,200 @@ def plot_log2fc_combined(ddct_df: pd.DataFrame, stats_results: dict, control_con
         sub = ddct_df[ddct_df["Target"] == target].dropna(subset=["log2FC"])
         _draw_log2fc_panel(ax, sub, control_condition, stats_results.get(target), target)
 
-    sup = fig.suptitle(f"log2FC vs {control_condition} - all targets", y=0.98)
+    sup = fig.suptitle(f"log2FC vs {control_condition} — all targets", y=0.98)
     _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.90]))
     fig.savefig(outdir / "log2FC_all_targets.png", dpi=dpi)
+    plt.close(fig)
+
+
+def _draw_rq_bar_panel(ax, sub: pd.DataFrame, control_condition: str,
+                        res: Optional["TargetStatsResult"], title: str,
+                        highlight_target: Optional[str] = None,
+                        highlight_color: str = "#3B6FB8", other_color: str = "#9E9E9E",
+                        highlight_label: str = "targets this gene",
+                        other_label: str = "does not target this gene") -> Optional[list]:
+    """Draw one target's RQ bar chart (mean bar + SEM-of-ddCt whiskers +
+    individual biological-replicate points + dashed RQ=1 line + significance
+    brackets vs. control) onto an existing Axes -- the same visual language
+    as plot_log2fc's stripplot, just bar-style on the linear RQ scale
+    instead of a scatter on the log2FC scale. Shared by plot_rq_bar (one
+    file per target) and plot_rq_bar_combined (all targets side by side).
+
+    Bar height = 2^-mean(ddCt) (the geometric mean of the per-replicate RQ
+    values). Whiskers are +/- 1 SEM of ddCt, converted onto the RQ scale
+    (asymmetric, since it's a log-linear transform) -- matching a standard
+    ddCt-based RQ bar plot convention. Individual points are each biological
+    replicate's own RQ = 2^-ddCt, jittered slightly on x.
+
+    If `highlight_target` is given, a condition's bar/points are colored
+    `highlight_color` when `highlight_target` appears as a case-insensitive
+    substring of the condition name, else `other_color` -- reproduces the
+    "targets this gene" / "does not target this gene" legend convention used
+    for dCas9/CRISPRoff-style gene-silencing experiments. Leave it None for
+    assays (e.g. digestion-efficiency) where that distinction doesn't apply;
+    every bar is then drawn in `other_color`."""
+    order = sorted(sub["Condition"].unique(), key=lambda c: (c != control_condition, c))
+    x_positions = {c: i for i, c in enumerate(order)}
+
+    rng = np.random.default_rng(0)
+    bar_heights, err_low, err_high, colors = [], [], [], []
+    point_x, point_y = [], []
+
+    for c in order:
+        csub = sub[sub["Condition"] == c]
+        ddct_vals = csub["ddCt"].dropna().to_numpy()
+        n = len(ddct_vals)
+        x0 = x_positions[c]
+
+        if n == 0:
+            bar_heights.append(np.nan)
+            err_low.append(0.0)
+            err_high.append(0.0)
+        else:
+            mean_ddct = float(np.mean(ddct_vals))
+            bar_rq = 2 ** (-mean_ddct)
+            bar_heights.append(bar_rq)
+            if n >= 2:
+                sem_ddct = float(np.std(ddct_vals, ddof=1) / np.sqrt(n))
+                err_low.append(bar_rq - 2 ** (-(mean_ddct + sem_ddct)))
+                err_high.append(2 ** (-(mean_ddct - sem_ddct)) - bar_rq)
+            else:
+                err_low.append(0.0)
+                err_high.append(0.0)
+            jitter = rng.uniform(-0.12, 0.12, size=n)
+            point_x.extend(x0 + jitter)
+            point_y.extend(2 ** (-ddct_vals))
+
+        if highlight_target:
+            colors.append(highlight_color if highlight_target.lower() in c.lower() else other_color)
+        else:
+            colors.append(other_color)
+
+    xs = [x_positions[c] for c in order]
+    ax.bar(xs, bar_heights, color=colors, edgecolor="black", linewidth=1.1,
+           width=0.62, zorder=2)
+    ax.errorbar(xs, bar_heights, yerr=[err_low, err_high], fmt="none",
+                ecolor="black", elinewidth=1.3, capsize=4, zorder=3)
+    ax.scatter(point_x, point_y, facecolors="white", edgecolors="black",
+               linewidth=1.1, s=55, zorder=4)
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=1, zorder=1)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(order, rotation=60, ha="right")
+    ax.set_ylabel("RQ (2^−ΔΔCt)")
+    ax.set_title(title)
+
+    legend_handles = None
+    if highlight_target:
+        from matplotlib.patches import Patch
+        legend_handles = [Patch(facecolor=other_color, edgecolor="black", label=other_label),
+                           Patch(facecolor=highlight_color, edgecolor="black", label=highlight_label)]
+        # Handed back to the caller rather than drawn here: the caller places
+        # one shared legend above the figure (title row), clear of the
+        # significance brackets/stats text that live inside the axes.
+
+    valid_tops = [h + e for h, e in zip(bar_heights, err_high) if pd.notna(h)]
+    visual_max = max(valid_tops + point_y + [1.0]) if (valid_tops or point_y) else 1.0
+    valid_bottoms = [h - e for h, e in zip(bar_heights, err_low) if pd.notna(h)]
+    visual_min = min([0.0] + valid_bottoms)
+
+    if res is not None and res.posthoc is not None and not res.posthoc.empty:
+        data_range = max(visual_max - visual_min, 0.3)
+        y_top = visual_max + 0.15 * data_range
+        y_step = 0.14 * data_range
+        n_brackets = len(res.posthoc)
+        _draw_significance_brackets(ax, x_positions, control_condition,
+                                     res.posthoc, y_top, y_step)
+        # Extra headroom (vs. the log2FC panel's +0.8) so the topmost
+        # bracket's label doesn't collide with the test-family/omnibus-p
+        # annotation anchored near the very top of the axes below.
+        ax.set_ylim(min(0.0, visual_min - 0.1 * data_range),
+                    y_top + (n_brackets + 1.9) * y_step)
+
+        fam = res.test_family
+        omni = f"{res.omnibus_test}: p={res.omnibus_p:.4g}" if res.omnibus_p is not None else ""
+        ax.text(0.99, 0.995, f"{fam}\n{omni}", transform=ax.transAxes,
+                 ha="right", va="top", fontsize=8, color="dimgray")
+    else:
+        ax.set_ylim(min(0.0, visual_min - 0.1 * max(visual_max - visual_min, 0.3)),
+                    visual_max + 0.15 * max(visual_max - visual_min, 0.3))
+
+    return legend_handles
+
+
+_RQ_FOOTNOTE = ("RQ = relative quantification (2^−ΔΔCt), geometric mean of "
+                "biological replicates; whiskers ± 1 SEM of ΔΔCt. "
+                "Dashed line = {control} (RQ = 1).")
+
+
+def plot_rq_bar(ddct_df: pd.DataFrame, stats_results: dict, control_condition: str,
+                 outdir: Path, dpi: int, highlight_target_match: bool = False):
+    """One RQ bar plot per target (primer pair) -- mean bar + SEM-of-ddCt
+    whiskers + individual biological-replicate points, dashed RQ=1 line,
+    significance brackets vs. control. Bar-chart counterpart to
+    plot_log2fc()'s stripplot, on the linear RQ scale."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    for target, sub in ddct_df.groupby("Target"):
+        sub = sub.dropna(subset=["ddCt"])
+        if sub.empty:
+            continue
+        n_conditions = sub["Condition"].nunique()
+        fig, ax = plt.subplots(figsize=(max(6, 1.3 * n_conditions), 6.5))
+        legend_handles = _draw_rq_bar_panel(
+            ax, sub, control_condition, stats_results.get(target),
+            f"{target} vs {control_condition}",
+            highlight_target=(target if highlight_target_match else None))
+        fig.text(0.01, 0.01, _RQ_FOOTNOTE.format(control=control_condition),
+                  fontsize=7.5, color="dimgray", ha="left")
+        top_rect = 1.0
+        if legend_handles:
+            fig.legend(handles=legend_handles, loc="upper center", ncol=2,
+                       bbox_to_anchor=(0.5, 1.0), fontsize=9, frameon=False)
+            top_rect = 0.90
+        _fit_title_and_layout(fig, ax.title, ax=ax,
+                               tight_kwargs=dict(rect=[0, 0.045, 1, top_rect]))
+        safe_target = re.sub(r"[^\w\-.]", "_", target)
+        fig.savefig(outdir / f"RQ_{safe_target}.png", dpi=dpi)
+        plt.close(fig)
+
+
+def plot_rq_bar_combined(ddct_df: pd.DataFrame, stats_results: dict, control_condition: str,
+                          outdir: Path, dpi: int, highlight_target_match: bool = False):
+    """All targets' RQ bar panels side by side in a single figure, mirroring
+    plot_log2fc_combined() but on the linear RQ scale."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    targets = [t for t, sub in ddct_df.groupby("Target")
+               if not sub["ddCt"].dropna().empty]
+    if not targets:
+        return
+
+    n_conditions = ddct_df["Condition"].nunique()
+    # Wider than plot_log2fc_combined's panels: the stats annotation
+    # (top-right) and the widest significance bracket (control vs. the
+    # farthest condition, roughly centered) both compete for space at the
+    # top of a bar-chart panel, more so than on the narrower stripplots.
+    panel_w = max(6, 1.5 * n_conditions)
+    fig, axes = plt.subplots(1, len(targets), figsize=(panel_w * len(targets), 6.5))
+    if len(targets) == 1:
+        axes = [axes]
+
+    legend_handles = None
+    for ax, target in zip(axes, targets):
+        sub = ddct_df[ddct_df["Target"] == target].dropna(subset=["ddCt"])
+        h = _draw_rq_bar_panel(ax, sub, control_condition, stats_results.get(target), target,
+                                highlight_target=(target if highlight_target_match else None))
+        legend_handles = legend_handles or h
+
+    sup = fig.suptitle(f"RQ vs {control_condition} — all targets", y=0.985)
+    fig.text(0.01, 0.01, _RQ_FOOTNOTE.format(control=control_condition),
+              fontsize=7.5, color="dimgray", ha="left")
+    top_rect = 0.90
+    if legend_handles:
+        fig.legend(handles=legend_handles, loc="upper center", ncol=2,
+                   bbox_to_anchor=(0.5, 0.925), fontsize=9, frameon=False)
+        top_rect = 0.85
+    _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0.05, 1, top_rect]))
+    fig.savefig(outdir / "RQ_all_targets.png", dpi=dpi)
     plt.close(fig)
 
 
@@ -1105,6 +1307,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha", type=float, default=0.05,
                     help="Significance threshold for normality/variance/omnibus tests "
                          "(default: 0.05).")
+    p.add_argument("--rq-highlight-target-match", action="store_true", default=False,
+                    help="In the RQ bar plots (plots/rq/), color a condition's bar/points "
+                         "differently when the plot's target/gene name appears as a "
+                         "case-insensitive substring of the condition name -- e.g. colors "
+                         "'CRISPRoff-HER2' differently from 'CRISPRoff-RGS9' on the HER2 RQ "
+                         "plot, reproducing the 'targets this gene' / 'does not target this "
+                         "gene' legend convention used for dCas9/CRISPRoff-style "
+                         "gene-silencing experiments. Off by default -- leave off for assays "
+                         "(e.g. digestion-efficiency) where condition names don't encode a "
+                         "target gene, since every bar would just end up 'does not target'.")
     p.add_argument("--dpi", type=int, default=150, help="Plot resolution (default: 150).")
     p.add_argument("--outdir", required=True, type=Path,
                     help="Output folder (created if it doesn't exist).")
@@ -1249,6 +1461,10 @@ def main(argv=None):
         plot_log2fc(ddct_df, stats_results, control_condition, args.outdir / "plots" / "log2fc", args.dpi)
         plot_log2fc_combined(ddct_df, stats_results, control_condition,
                               args.outdir / "plots" / "log2fc", args.dpi)
+        plot_rq_bar(ddct_df, stats_results, control_condition, args.outdir / "plots" / "rq", args.dpi,
+                    highlight_target_match=args.rq_highlight_target_match)
+        plot_rq_bar_combined(ddct_df, stats_results, control_condition, args.outdir / "plots" / "rq",
+                              args.dpi, highlight_target_match=args.rq_highlight_target_match)
 
     LOG.info("Done. Results written to %s", args.outdir.resolve())
     print(f"\nDone. See:\n  {tables_dir}\n  {args.outdir / 'plots'}\n  {log_path}")
