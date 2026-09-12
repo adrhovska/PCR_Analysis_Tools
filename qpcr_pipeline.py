@@ -1144,7 +1144,13 @@ def plot_rq_bar(ddct_df: pd.DataFrame, stats_results: dict, control_condition: s
         if sub.empty:
             continue
         n_conditions = sub["Condition"].nunique()
-        fig, ax = plt.subplots(figsize=(max(6, 1.3 * n_conditions), 6.5))
+        res = stats_results.get(target)
+        n_brackets = (len(res.posthoc) if (res is not None and res.posthoc is not None)
+                      else max(0, n_conditions - 1))
+        # More vertical room as the bracket stack grows -- a fixed height
+        # squeezes the brackets/stars together until they're unreadable.
+        fig_h = 6.5 + 0.6 * max(0, n_brackets - 2)
+        fig, ax = plt.subplots(figsize=(max(6, 1.3 * n_conditions), fig_h))
         legend_handles = _draw_rq_bar_panel(
             ax, sub, control_condition, stats_results.get(target),
             f"{target} vs {control_condition}",
@@ -1179,7 +1185,16 @@ def plot_rq_bar_combined(ddct_df: pd.DataFrame, stats_results: dict, control_con
     # farthest condition, roughly centered) both compete for space at the
     # top of a bar-chart panel, more so than on the narrower stripplots.
     panel_w = max(6, 1.5 * n_conditions)
-    fig, axes = plt.subplots(1, len(targets), figsize=(panel_w * len(targets), 6.5))
+    max_brackets = 0
+    for target in targets:
+        res = stats_results.get(target)
+        n_b = (len(res.posthoc) if (res is not None and res.posthoc is not None)
+               else max(0, n_conditions - 1))
+        max_brackets = max(max_brackets, n_b)
+    # Same reasoning as plot_rq_bar: a fixed height squeezes the bracket
+    # stack (and the significance stars on it) together until unreadable.
+    fig_h = 6.5 + 0.6 * max(0, max_brackets - 2)
+    fig, axes = plt.subplots(1, len(targets), figsize=(panel_w * len(targets), fig_h))
     if len(targets) == 1:
         axes = [axes]
 
@@ -1193,11 +1208,11 @@ def plot_rq_bar_combined(ddct_df: pd.DataFrame, stats_results: dict, control_con
     sup = fig.suptitle(f"RQ vs {control_condition} - all targets", y=0.985)
     fig.text(0.01, 0.01, _RQ_FOOTNOTE.format(control=control_condition),
               fontsize=7.5, color="dimgray", ha="left")
-    top_rect = 0.90
+    top_rect = 0.95
     if legend_handles:
         fig.legend(handles=legend_handles, loc="upper center", ncol=2,
                    bbox_to_anchor=(0.5, 0.925), fontsize=9, frameon=False)
-        top_rect = 0.85
+        top_rect = 0.88
     _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0.05, 1, top_rect]))
     fig.savefig(outdir / "RQ_all_targets.png", dpi=dpi)
     plt.close(fig)
