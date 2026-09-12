@@ -861,7 +861,7 @@ def plot_qc_replicates(replicate_log: pd.DataFrame, outdir: Path, dpi: int,
 
         handles, labels = axes[0].get_legend_handles_labels()
         plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-        sup = fig.suptitle(f"QC — {plate}", y=0.995)
+        sup = fig.suptitle(f"QC - {plate}", y=0.995)
         if handles:
             fig.legend(handles[:1], labels[:1], loc="lower center",
                        bbox_to_anchor=(0.5, 0.0), ncol=1)
@@ -904,7 +904,7 @@ def plot_cq_by_sample(group_summary: pd.DataFrame, anchor_by_plate: dict,
                 ax.set_ylabel(f"{target}\nCq (mean \u00b1 SD)")
                 ax.grid(True, alpha=0.3)
             plt.setp(axes[-1].get_xticklabels(), rotation=60, ha="right")
-            title = f"{plate} — Cq" + (" (anchor)" if with_anchor else "")
+            title = f"{plate} - Cq" + (" (anchor)" if with_anchor else "")
             sup = fig.suptitle(title)
             _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.97]))
             fig.savefig(outdir / f"cq_by_sample_{suffix}_{plate}.png", dpi=dpi)
@@ -1006,7 +1006,7 @@ def plot_log2fc_combined(ddct_df: pd.DataFrame, stats_results: dict, control_con
         sub = ddct_df[ddct_df["Target"] == target].dropna(subset=["log2FC"])
         _draw_log2fc_panel(ax, sub, control_condition, stats_results.get(target), target)
 
-    sup = fig.suptitle(f"log2FC vs {control_condition} — all targets", y=0.98)
+    sup = fig.suptitle(f"log2FC vs {control_condition} - all targets", y=0.98)
     _fit_title_and_layout(fig, sup, ax=None, tight_kwargs=dict(rect=[0, 0, 1, 0.90]))
     fig.savefig(outdir / "log2FC_all_targets.png", dpi=dpi)
     plt.close(fig)
@@ -1190,7 +1190,7 @@ def plot_rq_bar_combined(ddct_df: pd.DataFrame, stats_results: dict, control_con
                                 highlight_target=(target if highlight_target_match else None))
         legend_handles = legend_handles or h
 
-    sup = fig.suptitle(f"RQ vs {control_condition} — all targets", y=0.985)
+    sup = fig.suptitle(f"RQ vs {control_condition} - all targets", y=0.985)
     fig.text(0.01, 0.01, _RQ_FOOTNOTE.format(control=control_condition),
               fontsize=7.5, color="dimgray", ha="left")
     top_rect = 0.90
